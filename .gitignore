@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+udemy_browser_session/
+*_links.txt
+*_links.json
