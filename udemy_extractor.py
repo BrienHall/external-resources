@@ -249,8 +249,13 @@ def _find_chrome() -> Optional[str]:
     return None
 
 
-def get_cookies_via_browser(course_url: str, headless: bool) -> list[dict]:
-    """Open Chromium, let user log in once, return all cookies."""
+def get_cookies_via_browser(course_url: str, headless: bool) -> tuple[list[dict], Optional[int], Optional[str]]:
+    """
+    Open Chromium, let the user log in, then return:
+      (cookies, course_id_or_None, course_title_or_None)
+    Course ID is extracted from the page while the browser is open,
+    which is more reliable than later API calls.
+    """
     SESSION_DIR.mkdir(exist_ok=True)
 
     chrome_path = _find_chrome()
@@ -264,6 +269,9 @@ def get_cookies_via_browser(course_url: str, headless: bool) -> list[dict]:
         print(f"  Using browser: {chrome_path}")
         launch_kwargs["executable_path"] = chrome_path
 
+    course_id: Optional[int] = None
+    course_title: Optional[str] = None
+
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(**launch_kwargs)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -273,20 +281,75 @@ def get_cookies_via_browser(course_url: str, headless: bool) -> list[dict]:
             page.goto(course_url, wait_until="domcontentloaded", timeout=30_000)
         except PlaywrightTimeout:
             print("  ⚠ Page load timed out; continuing with whatever loaded.")
-        time.sleep(2)
+        time.sleep(3)
 
-        # Detect login wall
-        if page.query_selector('input[name="email"], [data-purpose="header-login"]'):
-            print("\n  ⚠  Not logged in.  Please log into Udemy in the browser window.")
-            input("     Press ENTER when you're fully logged in … ")
-            page.goto(course_url, wait_until="domcontentloaded", timeout=30_000)
-            time.sleep(2)
+        # Detect login wall — Udemy Business may use SSO so always confirm
+        needs_login = bool(
+            page.query_selector('input[name="email"]')
+            or page.query_selector('[data-purpose="header-login"]')
+            or "login" in page.url.lower()
+            or "sso" in page.url.lower()
+        )
+        if needs_login:
+            print("\n  ⚠  Not logged in. Please log into Udemy Business in the browser window.")
+            input("     Press ENTER once you are fully logged in and can see the course page … ")
+            try:
+                page.goto(course_url, wait_until="domcontentloaded", timeout=30_000)
+            except PlaywrightTimeout:
+                pass
+            time.sleep(3)
+
+        # Extract course ID from page JavaScript while browser is open
+        html = page.content()
+        for pattern in [
+            r'"courseId"\s*:\s*(\d+)',
+            r'data-course-id=["\'](\d+)["\']',
+            r'"id"\s*:\s*(\d+)\s*,\s*"[^"]*title',
+            r'/learn/v4/(\d+)/',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                course_id = int(m.group(1))
+                break
+
+        # Also try navigating to the learn URL to get course ID from redirect
+        if not course_id:
+            slug_m = re.search(r"/course/([^/?#]+)", course_url)
+            if slug_m:
+                slug = slug_m.group(1)
+                host = urlparse(course_url).netloc
+                try:
+                    page.goto(
+                        f"https://{host}/course/{slug}/learn/",
+                        wait_until="domcontentloaded",
+                        timeout=20_000,
+                    )
+                    time.sleep(2)
+                    m = re.search(r"/learn/v4/(\d+)/", page.url)
+                    if m:
+                        course_id = int(m.group(1))
+                    if not course_id:
+                        m = re.search(r'"courseId"\s*:\s*(\d+)', page.content())
+                        if m:
+                            course_id = int(m.group(1))
+                except Exception:
+                    pass
+
+        # Extract course title from page
+        title_m = re.search(r'"title"\s*:\s*"([^"]{5,})"', html)
+        if title_m:
+            course_title = title_m.group(1)
+
+        if course_id:
+            print(f"  Course ID extracted from browser: {course_id}")
+        else:
+            print("  ⚠ Could not extract course ID from page — will try API fallbacks.")
 
         cookies = ctx.cookies()
         ctx.close()
 
     print(f"  Captured {len(cookies)} cookies.")
-    return cookies
+    return cookies, course_id, course_title
 
 
 # ── Requests session from cookies ──────────────────────────────────────────────
@@ -304,69 +367,103 @@ def build_session(cookies: list[dict], host: str) -> requests.Session:
     })
     for c in cookies:
         s.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+
+    # CSRF token
     csrf = s.cookies.get("csrftoken", "")
     if csrf:
         s.headers["X-CSRFToken"] = csrf
+
+    # Udemy Business uses a Bearer token — check common cookie names
+    bearer = None
+    for name in ("access_token", "ud-access-token", "ud_access_token", "bearer_token"):
+        val = s.cookies.get(name, "")
+        if val:
+            bearer = val
+            break
+    if bearer:
+        s.headers["Authorization"] = f"Bearer {bearer}"
+        print(f"  Bearer token found in cookie '{name}'")
+    else:
+        print("  ⚠ No bearer token cookie found — API calls will use session cookies only.")
+
     return s
 
 
 # ── Udemy API helpers ──────────────────────────────────────────────────────────
 
-def resolve_course(session: requests.Session, course_url: str, host: str) -> tuple[int, str]:
-    """
-    Return (course_id, course_title).
-    Tries the courses search API first; falls back to scraping the page HTML.
-    """
+def resolve_course(
+    session: requests.Session,
+    course_url: str,
+    host: str,
+    browser_course_id: Optional[int] = None,
+    browser_course_title: Optional[str] = None,
+) -> tuple[int, str]:
+    """Return (course_id, course_title)."""
     api_base = API_BASE_TEMPLATE.format(host=host)
     slug_m = re.search(r"/course/([^/?#]+)", course_url)
     if not slug_m:
         raise ValueError(f"Cannot extract slug from URL: {course_url}")
     slug = slug_m.group(1)
 
+    # Strategy 0: use ID extracted directly from browser page (most reliable)
+    if browser_course_id:
+        # Verify it works with the API and get a proper title
+        try:
+            r = session.get(
+                f"{api_base}/courses/{browser_course_id}/",
+                params={"fields[course]": "id,title"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                return data["id"], data.get("title", browser_course_title or slug)
+        except Exception:
+            pass
+        return browser_course_id, browser_course_title or slug
+
     # Strategy 1: API search by slug
-    try:
-        r = session.get(
-            f"{api_base}/courses/",
-            params={"slug": slug, "fields[course]": "id,title"},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            results = r.json().get("results", [])
-            if results:
-                return results[0]["id"], results[0]["title"]
-    except Exception:
-        pass
+    r1 = session.get(
+        f"{api_base}/courses/",
+        params={"slug": slug, "fields[course]": "id,title"},
+        timeout=15,
+    )
+    print(f"  Strategy 1 (slug search): HTTP {r1.status_code}")
+    if r1.status_code == 200:
+        results = r1.json().get("results", [])
+        if results:
+            return results[0]["id"], results[0]["title"]
 
-    # Strategy 2: Scrape the course landing page for data-course-id / JS vars
-    try:
-        r = session.get(f"https://{host}/course/{slug}/", timeout=15)
-        html = r.text
-        # data-course-id="12345"
-        m = re.search(r'data-course-id=["\'](\d+)["\']', html)
-        if not m:
-            # window.UD.userData.courseId or similar
-            m = re.search(r'"courseId"\s*:\s*(\d+)', html)
-        if m:
-            course_id = int(m.group(1))
-            title_m = re.search(r'"course_title"\s*:\s*"([^"]+)"', html)
-            title = title_m.group(1) if title_m else slug
-            return course_id, title
-    except Exception:
-        pass
+    # Strategy 2: Scrape course landing page HTML for embedded JS data
+    r2 = session.get(f"https://{host}/course/{slug}/", timeout=15)
+    print(f"  Strategy 2 (landing page scrape): HTTP {r2.status_code}")
+    if r2.status_code == 200:
+        html = r2.text
+        for pattern in [
+            r'data-course-id=["\'](\d+)["\']',
+            r'"courseId"\s*:\s*(\d+)',
+            r'"id"\s*:\s*(\d+)',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                course_id = int(m.group(1))
+                title_m = re.search(r'"title"\s*:\s*"([^"]{5,})"', html)
+                title = title_m.group(1) if title_m else slug
+                return course_id, title
 
-    # Strategy 3: Parse course_id from learn-page URL redirect
-    try:
-        r = session.get(f"https://{host}/course/{slug}/learn/", allow_redirects=True, timeout=15)
-        m = re.search(r"/learn/v4/(\d+)/", r.url)
-        if m:
-            course_id = int(m.group(1))
-            return course_id, slug
-    except Exception:
-        pass
+    # Strategy 3: Follow redirect on learn URL
+    r3 = session.get(
+        f"https://{host}/course/{slug}/learn/", allow_redirects=True, timeout=15
+    )
+    print(f"  Strategy 3 (learn redirect): HTTP {r3.status_code}, final URL: {r3.url}")
+    m = re.search(r"/learn/v4/(\d+)/", r3.url)
+    if m:
+        return int(m.group(1)), slug
 
     raise RuntimeError(
-        f"Could not resolve course ID for slug '{slug}'. "
-        "Make sure you are enrolled and the course URL is correct."
+        f"Could not resolve course ID for '{slug}'.\n"
+        f"  • Make sure you are enrolled in the course.\n"
+        f"  • Try deleting udemy_browser_session/ and re-running so you can log in fresh.\n"
+        f"  • HTTP status codes above indicate whether requests are reaching Udemy."
     )
 
 
@@ -663,7 +760,9 @@ def main() -> None:
 
     # ── 1. Browser auth ───────────────────────────────────────────────────────
     print("\n[1/5] Browser authentication")
-    cookies = get_cookies_via_browser(args.course_url, args.headless)
+    cookies, browser_course_id, browser_course_title = get_cookies_via_browser(
+        args.course_url, args.headless
+    )
 
     # ── 2. Build API session ──────────────────────────────────────────────────
     print("\n[2/5] Building API session")
@@ -672,7 +771,9 @@ def main() -> None:
     # ── 3. Resolve course ─────────────────────────────────────────────────────
     print("\n[3/5] Resolving course")
     try:
-        course_id, course_title = resolve_course(session, args.course_url, host)
+        course_id, course_title = resolve_course(
+            session, args.course_url, host, browser_course_id, browser_course_title
+        )
     except Exception as e:
         print(f"  ✗ {e}")
         sys.exit(1)
