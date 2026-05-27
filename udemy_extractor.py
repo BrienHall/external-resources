@@ -226,18 +226,46 @@ def bare_urls_from_text(text: str) -> list[str]:
 
 # ── Browser: login + cookie extraction ────────────────────────────────────────
 
+# Common Chrome/Chromium locations to try if Playwright's own build is missing
+_CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+]
+
+
+def _find_chrome() -> Optional[str]:
+    import os
+    # Honour explicit env var first
+    env = os.environ.get("CHROME_PATH") or os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    if env and Path(env).exists():
+        return env
+    for candidate in _CHROME_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
 def get_cookies_via_browser(course_url: str, headless: bool) -> list[dict]:
     """Open Chromium, let user log in once, return all cookies."""
     SESSION_DIR.mkdir(exist_ok=True)
-    host = urlparse(course_url).netloc  # e.g. learning.udemy.com
+
+    chrome_path = _find_chrome()
+    launch_kwargs: dict = {
+        "user_data_dir": str(SESSION_DIR),
+        "headless": headless,
+        "viewport": {"width": 1440, "height": 900},
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    if chrome_path:
+        print(f"  Using browser: {chrome_path}")
+        launch_kwargs["executable_path"] = chrome_path
 
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(SESSION_DIR),
-            headless=headless,
-            viewport={"width": 1440, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        ctx = p.chromium.launch_persistent_context(**launch_kwargs)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         print(f"  Opening {course_url} …")
