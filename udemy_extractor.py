@@ -124,10 +124,7 @@ def get_curriculum(page) -> list[dict]:
     """Return [{title, href, section}] in sidebar order."""
     # Expand all collapsed sections via JS
     page.evaluate("""() => {
-        document.querySelectorAll(
-            '[data-purpose="section-panel-toggler"][aria-expanded="false"], '
-            '[aria-expanded="false"][class*="section"]'
-        ).forEach(b => b.click());
+        document.querySelectorAll('[data-purpose="section-panel-toggler"][aria-expanded="false"], [aria-expanded="false"][class*="section"]').forEach(b => b.click());
     }""")
     time.sleep(1.5)
 
