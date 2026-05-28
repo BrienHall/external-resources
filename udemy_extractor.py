@@ -122,35 +122,81 @@ def links_from_html(html: str) -> list[tuple[str, str]]:
 
 def get_curriculum(page) -> list[dict]:
     """Return [{title, href, section}] in sidebar order."""
-    # Expand all collapsed sections via JS
+
+    # Expand every collapsed section — try several selector patterns
     page.evaluate("""() => {
-        document.querySelectorAll('[data-purpose="section-panel-toggler"][aria-expanded="false"], [aria-expanded="false"][class*="section"]').forEach(b => b.click());
+        const selectors = [
+            '[data-purpose="section-panel-toggler"][aria-expanded="false"]',
+            '[aria-expanded="false"][class*="section"]',
+            '[aria-expanded="false"]'
+        ];
+        selectors.forEach(sel => {
+            document.querySelectorAll(sel).forEach(b => { try { b.click(); } catch(e) {} });
+        });
     }""")
     time.sleep(1.5)
 
-    # Walk the sidebar in DOM order via JS — sections then lectures
-    return page.evaluate("""() => {
+    # Strategy 1 — data-purpose attributes (classic Udemy / Udemy Business)
+    items = page.evaluate("""() => {
         const items = [];
         let section = "Introduction";
-
-        const nodes = document.querySelectorAll(
-            '[data-purpose="section-panel-toggler"], [data-purpose="curriculum-item-link"]'
-        );
-
+        const nodes = document.querySelectorAll('[data-purpose="section-panel-toggler"], [data-purpose="curriculum-item-link"]');
         for (const node of nodes) {
             if (node.dataset.purpose === "section-panel-toggler") {
-                const spans = Array.from(node.querySelectorAll("span"))
-                    .map(s => s.textContent.trim()).filter(t => t.length > 3);
+                const spans = Array.from(node.querySelectorAll("span")).map(s => s.textContent.trim()).filter(t => t.length > 3);
                 if (spans.length) section = spans[0];
             } else {
                 const titleEl = node.querySelector('[data-purpose="item-title"]');
                 const title = (titleEl || node).textContent.trim().slice(0, 120);
-                const href  = node.getAttribute("href");
+                const href = node.getAttribute("href");
                 if (href && title) items.push({ title, href, section });
             }
         }
         return items;
     }""") or []
+
+    if items:
+        return items
+
+    # Strategy 2 — find all lecture links by URL pattern (/learn/lecture/ or /learn/v4/)
+    items = page.evaluate("""() => {
+        const items = [];
+        const links = Array.from(document.querySelectorAll('a[href*="/learn/lecture/"], a[href*="/learn/v4/"]'));
+        for (const link of links) {
+            const href = link.getAttribute("href");
+            const title = (link.querySelector('[class*="title"]') || link).textContent.trim().slice(0, 120) || href;
+
+            // Walk up to find section heading
+            let section = "Course Content";
+            let el = link.parentElement;
+            for (let i = 0; i < 8; i++) {
+                if (!el) break;
+                const heading = el.querySelector('h2, h3, h4, [class*="section-title"], [class*="chapter-title"]');
+                if (heading) { section = heading.textContent.trim().slice(0, 100); break; }
+                el = el.parentElement;
+            }
+            if (href) items.push({ title, href, section });
+        }
+        return items;
+    }""") or []
+
+    if items:
+        return items
+
+    # Strategy 3 — any sidebar link that looks like a lecture
+    items = page.evaluate("""() => {
+        const items = [];
+        const links = Array.from(document.querySelectorAll('aside a[href], nav a[href], [class*="sidebar"] a[href], [class*="curriculum"] a[href]'));
+        for (const link of links) {
+            const href = link.getAttribute("href");
+            if (!href || href === "#" || href.startsWith("javascript")) continue;
+            const title = link.textContent.trim().slice(0, 120);
+            if (title) items.push({ title, href, section: "Course Content" });
+        }
+        return items;
+    }""") or []
+
+    return items
 
 
 # ── Per-lecture scraping ────────────────────────────────────────────────────────
@@ -289,6 +335,8 @@ def main():
     ap.add_argument("--headless", action="store_true", default=False)
     ap.add_argument("--delay", type=float, default=2.0,
                     help="Seconds to wait after loading each lecture (default: 2.0)")
+    ap.add_argument("--debug", action="store_true", default=False,
+                    help="Save page HTML to debug_page.html if curriculum is empty")
     args = ap.parse_args()
 
     host = urlparse(args.course_url).netloc
@@ -335,6 +383,10 @@ def main():
         print(f"  {len(curriculum)} lectures found")
 
         if not curriculum:
+            if args.debug:
+                debug_file = Path("debug_page.html")
+                debug_file.write_text(page.content(), encoding="utf-8")
+                print(f"  Saved page HTML → {debug_file}  (open in a browser to inspect)")
             print("  No lectures found — make sure you're enrolled and the sidebar is visible.")
             ctx.close()
             return
