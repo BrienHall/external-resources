@@ -213,46 +213,83 @@ def scrape_lecture(page, base_url: str, lecture: dict, delay: float) -> list[dic
         return results
 
     def add_links(html: str, source: str):
+        before = len(results)
         for link_url, text in links_from_html(html):
+            if not any(r["url"] == link_url for r in results):
+                results.append({
+                    "url": link_url,
+                    "text": text,
+                    "source": source,
+                    "section": lecture["section"],
+                    "lecture": lecture["title"],
+                    "tool": tool_label(link_url),
+                })
+        return len(results) - before
+
+    # Try clicking each tab then scraping its panel.
+    # We attempt several selector patterns since Udemy's class names vary.
+    tab_pairs = [
+        # (tab button selectors,  content panel selectors,  source label)
+        (
+            ['[data-purpose="overview-tab"]', 'button:has-text("Overview")',
+             '[role="tab"]:has-text("Overview")', 'button:has-text("Description")'],
+            ['[data-purpose="lecture-description"]', '[class*="description--content"]',
+             '[class*="lecture-description"]', '[class*="tab-overview"]',
+             '[data-purpose="tab-overview-content"]'],
+            "description",
+        ),
+        (
+            ['[data-purpose="resources-tab"]', 'button:has-text("Resources")',
+             '[role="tab"]:has-text("Resources")'],
+            ['[data-purpose="lecture-resources"]', '[class*="resources--content"]',
+             '[class*="lecture-resources"]', '[data-purpose="tab-resources-content"]'],
+            "resource",
+        ),
+    ]
+
+    for tab_sels, panel_sels, source in tab_pairs:
+        # Click the tab
+        for sel in tab_sels:
+            try:
+                btn = page.query_selector(sel)
+                if btn:
+                    btn.click()
+                    time.sleep(0.8)
+                    break
+            except Exception:
+                pass
+
+        # Grab the panel content
+        for sel in panel_sels:
+            el = page.query_selector(sel)
+            if el:
+                add_links(el.inner_html(), source)
+                break
+
+    # Fallback: scan the entire page for external links not already captured.
+    # Excludes the sidebar (curriculum links) and main nav to reduce noise.
+    page_links = page.evaluate("""() => {
+        const skip = new Set([...document.querySelectorAll(
+            'nav a, header a, [class*="sidebar"] a, [data-purpose="curriculum-item-link"]'
+        )].map(a => a.href));
+
+        return Array.from(document.querySelectorAll('main a, [class*="content"] a, [class*="description"] a, [class*="resource"] a, article a'))
+            .filter(a => a.href && !skip.has(a.href))
+            .map(a => ({ url: a.href, text: (a.textContent || "").trim().slice(0, 150) }));
+    }""") or []
+
+    for item in page_links:
+        if is_external(item["url"]) and not any(r["url"] == item["url"] for r in results):
             results.append({
-                "url": link_url,
-                "text": text,
-                "source": source,
+                "url": item["url"],
+                "text": item["text"],
+                "source": "page",
                 "section": lecture["section"],
                 "lecture": lecture["title"],
-                "tool": tool_label(link_url),
+                "tool": tool_label(item["url"]),
             })
 
-    # Overview / description tab
-    for sel in ['[data-purpose="overview-tab"]', 'button:has-text("Overview")',
-                'button:has-text("Description")', '[role="tab"]:has-text("Overview")']:
-        try:
-            btn = page.query_selector(sel)
-            if btn:
-                btn.click()
-                time.sleep(0.8)
-                break
-        except Exception:
-            pass
-
-    for sel in ['[data-purpose="lecture-description"]', '[class*="description--content"]',
-                '[class*="description"]', '.ud-component--course-taking--tab-overview']:
-        el = page.query_selector(sel)
-        if el:
-            add_links(el.inner_html(), "description")
-            break
-
-    # Resources tab
-    for sel in ['[data-purpose="resources-tab"]', 'button:has-text("Resources")',
-                '[role="tab"]:has-text("Resources")']:
-        try:
-            btn = page.query_selector(sel)
-            if btn:
-                btn.click()
-                time.sleep(0.8)
-                break
-        except Exception:
-            pass
+    return results
 
     for sel in ['[data-purpose="lecture-resources"]', '[class*="resources--content"]',
                 '[class*="resources"]']:
